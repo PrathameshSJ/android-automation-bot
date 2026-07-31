@@ -82,71 +82,137 @@ def tap(x: int, y: int):
     """Executes the adb tap command."""
     adb("shell", "input", "tap", str(x), str(y))
 
-def check_time_n_click(timeout: int = 10) -> bool:
+# Globals to keep track of checked slots and pending slots
+TRIED_SLOTS = set()
+PENDING_SLOTS = []
+
+def find_untried_matching_slots(xml_path: str, time1, time2, time_pattern) -> list:
     """
-    Finds a time range (e.g., 11:00 - 12:00) on screen that matches the current system time,
-    with a 10-minute offset backward.
+    Parses the XML dump and returns a list of matching slots.
+    Each slot in the list is a dict:
+    {
+        "slot_id": "11:00 - 12:00",
+        "bounds": (x1, y1, x2, y2),
+        "center": (center_x, center_y)
+    }
     """
-    now = datetime.now()
-    target_datetime = now - timedelta(minutes=10)
-    target_time = target_datetime.time()
+    try:
+        tree = ET.parse(xml_path)
+    except ET.ParseError:
+        return []
+
+    slots = []
+    seen_ids_in_dump = set()
+
+    for node in tree.iter():
+        text = node.get('text', '')
+        content_desc = node.get('content-desc', '')
+        
+        match = time_pattern.search(text) or time_pattern.search(content_desc)
+        if match:
+            start_str, end_str = match.groups()
+            slot_id = f"{start_str} - {end_str}"
+            
+            if slot_id in seen_ids_in_dump:
+                continue
+                
+            try:
+                start_h, start_m = map(int, start_str.split(':'))
+                end_h, end_m = map(int, end_str.split(':'))
+                
+                from datetime import time as dt_time
+                slot_start = dt_time(start_h, start_m)
+                slot_end = dt_time(end_h, end_m)
+            except ValueError:
+                continue
+                
+            is_in_range = False
+            for target_time in (time1, time2):
+                if slot_start <= slot_end:
+                    if slot_start <= target_time < slot_end:
+                        is_in_range = True
+                        break
+                else:
+                    if target_time >= slot_start or target_time < slot_end:
+                        is_in_range = True
+                        break
+                        
+            if is_in_range:
+                bounds = node.get('bounds')
+                if bounds and bounds != "[0,0][0,0]":
+                    coords = bounds.replace('][', ',').strip('[]').split(',')
+                    try:
+                        x1, y1, x2, y2 = map(int, coords)
+                        center_x, center_y = (x1 + x2) // 2, (y1 + y2) // 2
+                        seen_ids_in_dump.add(slot_id)
+                        slots.append({
+                            "slot_id": slot_id,
+                            "bounds": (x1, y1, x2, y2),
+                            "center": (center_x, center_y)
+                        })
+                    except ValueError:
+                        pass
+    return slots
+
+def check_time_n_click(timeout: int = 11) -> bool:
+    """
+    Finds a time range matching current time or current time - 10 minutes.
+    If multiple valid slots are found, tries the first untried one,
+    and saves any other untried matching slots in PENDING_SLOTS.
+    """
+    global TRIED_SLOTS, PENDING_SLOTS
     
-    print(f"Looking for time slot... (Current time: {now.strftime('%H:%M')}, Adjusted target: {target_datetime.strftime('%H:%M')})")
+    # Reset PENDING_SLOTS for this scan
+    PENDING_SLOTS = []
+    
+    now = datetime.now()
+    time1 = now.time()
+    time2 = (now - timedelta(minutes=10)).time()
+    
+    print(f"Looking for time slot... (Current time: {now.strftime('%H:%M')}, Adjusted target: {(now - timedelta(minutes=10)).strftime('%H:%M')})")
+    print(f"Already tried slots: {list(TRIED_SLOTS)}")
     
     time_pattern = re.compile(r"(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})")
     
-    start_time = time.time()
-    while (time.time() - start_time) < timeout:
-        xml_path = dump_ui()
-        
+    # 1. Dump UI and scan current screen
+    print("Checking for time slot on current screen...")
+    xml_path = dump_ui()
+    slots = find_untried_matching_slots(xml_path, time1, time2, time_pattern)
+    untried_slots = [s for s in slots if s["slot_id"] not in TRIED_SLOTS]
+    
+    # 2. If not found on current screen, swipe up and check again
+    if not untried_slots:
+        print("No untried matching slots found on current screen. Swiping up a bit...")
         try:
-            tree = ET.parse(xml_path)
-        except ET.ParseError:
-            time.sleep(0.5)
-            continue
+            # Swipe from center-bottom (500, 1200) to center-top (500, 800) over 300ms
+            adb("shell", "input", "swipe", "500", "1200", "500", "800", "300")
+            time.sleep(1.5)  # Wait for the scroll animation to settle
+        except Exception as e:
+            print(f"Swipe failed: {e}")
             
-        for node in tree.iter():
-            text = node.get('text', '')
-            content_desc = node.get('content-desc', '')
-            
-            match = time_pattern.search(text) or time_pattern.search(content_desc)
-            
-            if match:
-                start_str, end_str = match.groups()
-                
-                try:
-                    start_h, start_m = map(int, start_str.split(':'))
-                    end_h, end_m = map(int, end_str.split(':'))
-                    
-                    from datetime import time as dt_time
-                    slot_start = dt_time(start_h, start_m)
-                    slot_end = dt_time(end_h, end_m)
-                except ValueError:
-                    continue
-                
-                is_in_range = False
-                if slot_start <= slot_end:
-                    is_in_range = slot_start <= target_time < slot_end
-                else:
-                    is_in_range = target_time >= slot_start or target_time < slot_end
-                    
-                if is_in_range:
-                    bounds = node.get('bounds')
-                    if bounds and bounds != "[0,0][0,0]":
-                        coords = bounds.replace('][', ',').strip('[]').split(',')
-                        try:
-                            x1, y1, x2, y2 = map(int, coords)
-                            center_x, center_y = (x1 + x2) // 2, (y1 + y2) // 2
-                            print(f"  -> Found active slot '{start_str} - {end_str}'! Tapping ({center_x}, {center_y})")
-                            tap(center_x, center_y)
-                            return True
-                        except ValueError:
-                            pass
-                        
-        time.sleep(0.5) 
+        print("Checking for time slot once again after swipe...")
+        xml_path = dump_ui()
+        slots_after_swipe = find_untried_matching_slots(xml_path, time1, time2, time_pattern)
+        untried_slots = [s for s in slots_after_swipe if s["slot_id"] not in TRIED_SLOTS]
         
-    print(f"  -> FAILED: No matching time range found within {timeout} seconds.")
-    return False
+    if not untried_slots:
+        print("  -> FAILED: No untried matching time range found.")
+        TRIED_SLOTS.clear()
+        PENDING_SLOTS = []
+        return False
+        
+    # We found at least one untried slot!
+    target_slot = untried_slots[0]
+    
+    # Save the other untried slots in PENDING_SLOTS
+    if len(untried_slots) > 1:
+        PENDING_SLOTS = [s["slot_id"] for s in untried_slots[1:]]
+        print(f"  -> Found multiple untried slots. Saving to pending: {PENDING_SLOTS}")
+    
+    print(f"  -> Tapping on slot '{target_slot['slot_id']}' at center {target_slot['center']}")
+    tap(target_slot['center'][0], target_slot['center'][1])
+    TRIED_SLOTS.add(target_slot['slot_id'])
+    return True
 
 def wait_for_text_and_click(target_text: str, timeout: int) -> bool:
     """Polls the UI until text appears, then clicks its center."""
@@ -165,7 +231,7 @@ def wait_for_text_and_click(target_text: str, timeout: int) -> bool:
             tap(center_x, center_y)
             return True
             
-        time.sleep(0.5)
+        time.sleep(1.5)
         
     print(f"  -> FAILED: '{target_text}' did not appear within {timeout} seconds.")
     return False
@@ -175,10 +241,10 @@ def execute_step(step: dict) -> bool:
     action = step.get("action")
     
     if action == "text":
-        return wait_for_text_and_click(step["target"], step.get("timeout", 10))
+        return wait_for_text_and_click(step["target"], step.get("timeout", 11))
         
     elif action == "check_time":
-        return check_time_n_click(step.get("timeout", 10))
+        return check_time_n_click(step.get("timeout", 11))
         
     elif action == "coord":
         x, y = step["x"], step["y"]
@@ -261,7 +327,7 @@ def close_app_routine(package_name: str = "edu.somaiya.somaiyaapp"):
         except Exception as e:
             print(f"Failed to remove task ID {task_id}: {e}")
 
-def check_device_connection(serial: str, timeout: int = 40) -> bool:
+def check_device_connection(serial: str, timeout: int = 41) -> bool:
     """Waits up to `timeout` seconds for the given device to be ready ('device' state)."""
     start_time = time.time()
     while (time.time() - start_time) < timeout:
@@ -274,7 +340,7 @@ def check_device_connection(serial: str, timeout: int = 40) -> bool:
                         return True
         except Exception:
             pass
-        time.sleep(1)
+        time.sleep(2)
     return False
 
 def device_exists_in_list(serial: str) -> bool:
@@ -290,7 +356,7 @@ def device_exists_in_list(serial: str) -> bool:
     return False
 
 def main():
-    global ADB_SERIAL
+    global ADB_SERIAL, TRIED_SLOTS, PENDING_SLOTS
     
     # 1. Handle device connection
     if len(sys.argv) > 1:
@@ -299,11 +365,11 @@ def main():
         
         # Check if the device exists in adb devices list
         if device_exists_in_list(ADB_SERIAL):
-            print(f"Device '{ADB_SERIAL}' exists. Waiting up to 40 seconds for it to wake/connect...")
-            if check_device_connection(ADB_SERIAL, timeout=40):
+            print(f"Device '{ADB_SERIAL}' exists. Waiting up to 41 seconds for it to wake/connect...")
+            if check_device_connection(ADB_SERIAL, timeout=41):
                 print(f"Device '{ADB_SERIAL}' is ready.")
             else:
-                print(f"Error: Device '{ADB_SERIAL}' did not connect/wake within 40 seconds.")
+                print(f"Error: Device '{ADB_SERIAL}' did not connect/wake within 41 seconds.")
                 sys.exit(1)
         else:
             print(f"Error: Device '{ADB_SERIAL}' does not exist in the list of ADB devices.")
@@ -332,56 +398,70 @@ def main():
             ADB_SERIAL = "emulator-5554"
             print("No active devices found. Starting emulator AVD 'Medium_Phone'...")
             os.system('start cmd /k emulator -avd Medium_Phone')
-            print("Waiting up to 40 seconds for the emulator to start and connect...")
-            if check_device_connection(ADB_SERIAL, timeout=40):
+            print("Waiting up to 41 seconds for the emulator to start and connect...")
+            if check_device_connection(ADB_SERIAL, timeout=41):
                 print(f"Emulator '{ADB_SERIAL}' started and connected successfully.")
             else:
-                print(f"Error: Emulator '{ADB_SERIAL}' failed to start or connect within 40 seconds.")
+                print(f"Error: Emulator '{ADB_SERIAL}' failed to start or connect within 41 seconds.")
                 sys.exit(1)
 
     # 2. Run the main workflow loop
-    while True:
-        print("\n--- Starting New Attempt ---")
-        
-        # Define the setup sequence
-        setup_steps = [
-            {"action": "launch_app", "package": "edu.somaiya.somaiyaapp"},
-            {"action": "sleep", "duration": 12},
-            {"action": "text", "target": "Attendance", "timeout": 10}, 
-            {"action": "sleep", "duration": 1},
-            {"action": "check_time", "timeout": 10},
-            {"action": "sleep", "duration": 3},
-        ]
-        
-        setup_success = True
-        for i, step in enumerate(setup_steps, 1):
-            if not execute_step(step):
-                print(f"Step {i} failed. Aborting current attempt.")
-                setup_success = False
-                break
-        
-        # If any part of the setup fails, reset the app and wait 1.5 mins
-        if not setup_success:
-            print("Error during setup sequence. Retrying in 1.5 mins...")
-            close_app_routine()
-            time.sleep(90)  # 1.5 minutes
-            continue
+    try:
+        while True:
+            print("\n--- Starting New Attempt ---")
             
-        # The main conditional check: Search for 'Submit' with a 3-second timeout
-        print("\n--- Checking for 'Submit' ---")
-        submit_found = wait_for_text_and_click("Submit", timeout=3)
-        
-        if submit_found:
-            print("Submit clicked! Waiting 3 seconds before exiting...")
-            time.sleep(3)
-            close_app_routine()
-            print("\nWorkflow completed successfully! Exiting script.")
-            break # Breaks the infinite loop and ends the script
-        else:
-            print("Submit text not found after 3 seconds. Quitting app and retrying...")
-            close_app_routine()
-            print("Sleeping for 1.5 minutes (90 seconds) before the next attempt...")
-            time.sleep(90)
+            # Define the setup sequence
+            setup_steps = [
+                {"action": "launch_app", "package": "edu.somaiya.somaiyaapp"},
+                {"action": "sleep", "duration": 13},
+                {"action": "text", "target": "Attendance", "timeout": 11}, 
+                {"action": "sleep", "duration": 2},
+                {"action": "check_time", "timeout": 11},
+                {"action": "sleep", "duration": 4},
+            ]
+            
+            setup_success = True
+            for i, step in enumerate(setup_steps, 1):
+                if not execute_step(step):
+                    print(f"Step {i} failed. Aborting current attempt.")
+                    setup_success = False
+                    break
+            
+            # If any part of the setup fails, reset the app and wait 31 secs
+            if not setup_success:
+                print("Error during setup sequence. Retrying in 31 seconds...")
+                close_app_routine()
+                time.sleep(31)  # 31 seconds
+                continue
+                
+            # The main conditional check: Search for 'Submit' with a 4-second timeout
+            print("\n--- Checking for 'Submit' ---")
+            submit_found = wait_for_text_and_click("Submit", timeout=4)
+            
+            if submit_found:
+                print("Submit clicked! Waiting 4 seconds...")
+                time.sleep(4)
+                close_app_routine()
+                TRIED_SLOTS.clear()
+                PENDING_SLOTS = []
+                print("\nWorkflow completed successfully! Continuing standby...")
+                print("Sleeping for 31 seconds before the next attempt...")
+                time.sleep(31)
+            else:
+                if PENDING_SLOTS:
+                    print(f"Submit text not found after 4 seconds, but we have pending slots: {PENDING_SLOTS}.")
+                    print("Quitting app quickly and retrying the other slots...")
+                    close_app_routine()
+                    time.sleep(2)  # Short sleep before quick retry
+                else:
+                    print("Submit text not found and no pending slots remain. Quitting app...")
+                    close_app_routine()
+                    TRIED_SLOTS.clear()
+                    print("Sleeping for 31 seconds before the next attempt...")
+                    time.sleep(31)
+    except KeyboardInterrupt:
+        print("\nScript interrupted by user. Exiting.")
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()
