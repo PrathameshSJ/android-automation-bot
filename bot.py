@@ -154,6 +154,32 @@ def find_untried_matching_slots(xml_path: str, time1, time2, time_pattern) -> li
                         pass
     return slots
 
+def scroll_up_twice():
+    """Scrolls up 2 times with a 0.5 sec delay between/after swipes."""
+    for i in range(2):
+        print(f"Scrolling up (swipe {i+1}/2)...")
+        try:
+            adb("shell", "input", "swipe", "500", "1200", "500", "800", "300")
+        except Exception as e:
+            print(f"Swipe failed: {e}")
+        time.sleep(0.5)
+
+def check_text_present_with_timeout(target_text: str, timeout: int) -> bool:
+    """Polls the UI until text is found, but does not click it."""
+    print(f"Checking if '{target_text}' is present (timeout: {timeout}s)...")
+    start_time = time.time()
+    while True:
+        xml_path = dump_ui()
+        bounds = find_text_bounds(xml_path, target_text)
+        if bounds:
+            print(f"  -> '{target_text}' is present!")
+            return True
+        if (time.time() - start_time) >= timeout:
+            break
+        time.sleep(1.0)
+    print(f"  -> '{target_text}' not found.")
+    return False
+
 def check_time_n_click(timeout: int = 11) -> bool:
     """
     Finds a time range matching current time or current time - 10 minutes.
@@ -180,17 +206,12 @@ def check_time_n_click(timeout: int = 11) -> bool:
     slots = find_untried_matching_slots(xml_path, time1, time2, time_pattern)
     untried_slots = [s for s in slots if s["slot_id"] not in TRIED_SLOTS]
     
-    # 2. If not found on current screen, swipe up and check again
+    # 2. If not found on current screen, scroll twice and check again
     if not untried_slots:
-        print("No untried matching slots found on current screen. Swiping up a bit...")
-        try:
-            # Swipe from center-bottom (500, 1200) to center-top (500, 800) over 300ms
-            adb("shell", "input", "swipe", "500", "1200", "500", "800", "300")
-            time.sleep(1.5)  # Wait for the scroll animation to settle
-        except Exception as e:
-            print(f"Swipe failed: {e}")
+        print("No untried matching slots found on current screen. Scrolling twice...")
+        scroll_up_twice()
             
-        print("Checking for time slot once again after swipe...")
+        print("Checking for time slot once again after scrolling...")
         xml_path = dump_ui()
         slots_after_swipe = find_untried_matching_slots(xml_path, time1, time2, time_pattern)
         untried_slots = [s for s in slots_after_swipe if s["slot_id"] not in TRIED_SLOTS]
@@ -213,6 +234,36 @@ def check_time_n_click(timeout: int = 11) -> bool:
     tap(target_slot['center'][0], target_slot['center'][1])
     TRIED_SLOTS.add(target_slot['slot_id'])
     return True
+
+def run_attendance_marking_routine() -> bool:
+    """
+    Tries to find a matching slot, clicks it, and checks for Submit.
+    If Submit is found, clicks it and returns True.
+    If Submit is not found, scrolls up twice (with 0.5s delay) and checks for additional slots,
+    repeating the process.
+    """
+    global TRIED_SLOTS, PENDING_SLOTS
+    
+    while True:
+        # Check time and click on a matching slot.
+        slot_clicked = check_time_n_click()
+        if not slot_clicked:
+            print("No matching slots found during marking routine.")
+            return False
+            
+        # A slot was found and clicked!
+        # Now check for Submit button with 4-second timeout
+        print("\n--- Checking for 'Submit' ---")
+        submit_found = wait_for_text_and_click("Submit", timeout=4)
+        if submit_found:
+            print("Submit clicked! Waiting 4 seconds...")
+            time.sleep(4)
+            return True
+            
+        # Submit not found!
+        print("Submit not found after clicking slot.")
+        # Scroll 2 times with 0.5s delay and check for any additional slots
+        scroll_up_twice()
 
 def wait_for_text_and_click(target_text: str, timeout: int) -> bool:
     """Polls the UI until text appears, then clicks its center."""
@@ -410,55 +461,69 @@ def main():
         while True:
             print("\n--- Starting New Attempt ---")
             
-            # Define the setup sequence
-            setup_steps = [
-                {"action": "launch_app", "package": "edu.somaiya.somaiyaapp"},
-                {"action": "sleep", "duration": 13},
-                {"action": "text", "target": "Attendance", "timeout": 11}, 
-                {"action": "sleep", "duration": 2},
-                {"action": "check_time", "timeout": 11},
-                {"action": "sleep", "duration": 4},
-            ]
+            # App open
+            print("Launching app package: edu.somaiya.somaiyaapp")
+            adb("shell", "monkey", "-p", "edu.somaiya.somaiyaapp", "-c", "android.intent.category.LAUNCHER", "1")
             
-            setup_success = True
-            for i, step in enumerate(setup_steps, 1):
-                if not execute_step(step):
-                    print(f"Step {i} failed. Aborting current attempt.")
-                    setup_success = False
-                    break
+            # Sleep 13 seconds
+            print("Sleeping for 13 seconds...")
+            time.sleep(13)
             
-            # If any part of the setup fails, reset the app and wait 31 secs
-            if not setup_success:
-                print("Error during setup sequence. Retrying in 31 seconds...")
-                close_app_routine()
-                time.sleep(31)  # 31 seconds
-                continue
+            attendance_completed = False
+            
+            while True:
+                # Check attendance (wait up to 11 seconds for "Attendance" text, click if found)
+                print("Checking for 'Attendance' button...")
+                attendance_found = wait_for_text_and_click("Attendance", timeout=11)
                 
-            # The main conditional check: Search for 'Submit' with a 4-second timeout
-            print("\n--- Checking for 'Submit' ---")
-            submit_found = wait_for_text_and_click("Submit", timeout=4)
-            
-            if submit_found:
-                print("Submit clicked! Waiting 4 seconds...")
-                time.sleep(4)
-                close_app_routine()
-                TRIED_SLOTS.clear()
-                PENDING_SLOTS = []
-                print("\nWorkflow completed successfully! Continuing standby...")
-                print("Sleeping for 31 seconds before the next attempt...")
-                time.sleep(31)
-            else:
-                if PENDING_SLOTS:
-                    print(f"Submit text not found after 4 seconds, but we have pending slots: {PENDING_SLOTS}.")
-                    print("Quitting app quickly and retrying the other slots...")
-                    close_app_routine()
-                    time.sleep(2)  # Short sleep before quick retry
+                if attendance_found:
+                    print("Attendance button clicked! Waiting 2 seconds...")
+                    time.sleep(2)
+                    
+                    # Mark attendance routine with time slot selector
+                    print("Starting attendance marking routine...")
+                    attendance_completed = run_attendance_marking_routine()
+                    break  # Break out of the inner loop to end the attempt
                 else:
-                    print("Submit text not found and no pending slots remain. Quitting app...")
-                    close_app_routine()
-                    TRIED_SLOTS.clear()
-                    print("Sleeping for 31 seconds before the next attempt...")
-                    time.sleep(31)
+                    # If attendance is not found, check for login
+                    print("Attendance button not found. Checking for LOGIN / login text...")
+                    login_found = check_text_present_with_timeout("login", timeout=4)
+                    
+                    if login_found:
+                        # Execute login routine
+                        print("Login text found! Executing login routine...")
+                        print("Tapping (660, 1800) exactly...")
+                        tap(660, 1800)
+                        print("Waiting 4 seconds...")
+                        time.sleep(4)
+                        print("Tapping (540, 1250) exactly...")
+                        tap(540, 1250)
+                        print("Waiting 5 seconds...")
+                        time.sleep(5)
+                        print("Tapping (975, 345) exactly...")
+                        tap(975, 345)
+                        print("Waiting 4 seconds...")
+                        time.sleep(4)
+                        
+                        # Loop back to check attendance again
+                        print("Login routine complete. Looping back to check attendance...")
+                        continue
+                    else:
+                        print("Login text not found. Aborting this attempt.")
+                        break  # Break out of the inner loop to restart
+            
+            if attendance_completed:
+                print("\nWorkflow completed successfully!")
+            else:
+                print("\nAttempt completed/failed without attendance marking.")
+                
+            print("Cleaning up app...")
+            close_app_routine()
+            TRIED_SLOTS.clear()
+            PENDING_SLOTS = []
+            
+            print("Sleeping for 30 seconds before the next attempt...")
+            time.sleep(30)
     except KeyboardInterrupt:
         print("\nScript interrupted by user. Exiting.")
         sys.exit(0)
