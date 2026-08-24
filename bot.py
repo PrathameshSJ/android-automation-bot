@@ -1,17 +1,19 @@
+#!/usr/bin/env python3
 """
 bot.py
 
 Combines native UI text detection, clicking capabilities, and the attendance
 automated workflow into a single file. Supports passing the target ADB serial 
-via command line arguments.
+via command line arguments. Cross-platform compatible (Linux, macOS, Windows).
 
 Usage:
-    py bot.py [adb_serial]
-    e.g., py bot.py emulator-5444
+    python3 bot.py [adb_serial]
+    e.g., python3 bot.py emulator-5554
 """
 
 import sys
 import os
+import shutil
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
@@ -19,42 +21,89 @@ import time
 import re
 from datetime import datetime, timedelta
 
+def find_executable(name: str) -> str:
+    """Finds an executable in PATH or standard Android SDK directories."""
+    path = shutil.which(name)
+    if path:
+        return path
+    
+    # Common SDK root paths
+    sdk_roots = [
+        os.environ.get("ANDROID_HOME"),
+        os.environ.get("ANDROID_SDK_ROOT"),
+        os.path.expanduser("~/Android/Sdk"),
+        os.path.expanduser("~/Library/Android/sdk"),
+        os.path.expandvars(r"%LOCALAPPDATA%\Android\Sdk"),
+        os.path.expandvars(r"%ANDROID_HOME%"),
+        os.path.expandvars(r"%ANDROID_SDK_ROOT%"),
+    ]
+    
+    exts = [".exe", ""] if sys.platform.startswith("win") else [""]
+    subdirs = ["platform-tools", "emulator", "tools", "cmdline-tools/latest/bin"]
+    
+    for root in sdk_roots:
+        if root and os.path.isdir(root):
+            for subdir in subdirs:
+                for ext in exts:
+                    candidate = os.path.join(root, subdir, name + ext)
+                    if os.path.isfile(candidate) and (not hasattr(os, "X_OK") or os.access(candidate, os.X_OK)):
+                        return candidate
+    return name
+
+ADB_BIN = find_executable("adb")
+EMULATOR_BIN = find_executable("emulator")
+
 # Default ADB serial fallback
 ADB_SERIAL = "emulator-5554"
 
 def adb(*args: str) -> subprocess.CompletedProcess:
     """Helper to run adb commands."""
     return subprocess.run(
-        ["adb", "-s", ADB_SERIAL, *args],
+        [ADB_BIN, "-s", ADB_SERIAL, *args],
         capture_output=True,
         text=True,
         check=True,
     )
 
-def dump_ui() -> str:
-    """Asks Android to dump the UI tree to XML and pulls it locally."""
+# Script directory for storing local dumps
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def dump_ui(retries: int = 2, retry_delay: float = 0.5) -> str:
+    """Asks Android to dump the UI tree to XML and pulls it locally to the script folder."""
     # Using /data/local/tmp because it is always writable by adb shell
     device_path = "/data/local/tmp/window_dump.xml"
-    local_path = os.path.join(tempfile.gettempdir(), "window_dump.xml")
+    local_path = os.path.join(SCRIPT_DIR, "window_dump.xml")
     
-    try:
-        # Generate the XML dump on the device
-        adb("shell", "uiautomator", "dump", device_path)
-        # Pull the XML to our local machine
-        adb("pull", device_path, local_path)
-    except subprocess.CalledProcessError as e:
-        print(f"Failed to dump UI: {e.stderr}")
-        sys.exit(1)
+    for attempt in range(retries):
+        try:
+            # Generate the XML dump on the device
+            result = adb("shell", "uiautomator", "dump", device_path)
+            if "ERROR" in (result.stdout or "") or "ERROR" in (result.stderr or ""):
+                # Try compressed dump if standard dump encounters an idle state error
+                adb("shell", "uiautomator", "dump", "--compressed", device_path)
+                
+            # Pull the XML to our local script folder
+            adb("pull", device_path, local_path)
+            if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+                return local_path
+        except subprocess.CalledProcessError:
+            pass
+        except Exception:
+            pass
+            
+        time.sleep(retry_delay)
         
-    return local_path
+    return None
 
 def find_text_bounds(xml_path: str, target_text: str) -> tuple:
     """Parses the XML and returns the (x1, y1, x2, y2) bounds of the target text."""
+    if not xml_path or not os.path.exists(xml_path):
+        return None
+
     try:
         tree = ET.parse(xml_path)
-    except ET.ParseError:
-        print("Failed to parse the XML dump.")
-        sys.exit(1)
+    except (ET.ParseError, Exception):
+        return None
 
     target_lower = target_text.lower()
     
@@ -96,9 +145,12 @@ def find_untried_matching_slots(xml_path: str, time1, time2, time_pattern) -> li
         "center": (center_x, center_y)
     }
     """
+    if not xml_path or not os.path.exists(xml_path):
+        return []
+
     try:
         tree = ET.parse(xml_path)
-    except ET.ParseError:
+    except (ET.ParseError, Exception):
         return []
 
     slots = []
@@ -383,7 +435,7 @@ def check_device_connection(serial: str, timeout: int = 41) -> bool:
     start_time = time.time()
     while (time.time() - start_time) < timeout:
         try:
-            result = subprocess.run(["adb", "devices"], capture_output=True, text=True, check=True)
+            result = subprocess.run([ADB_BIN, "devices"], capture_output=True, text=True, check=True)
             for line in result.stdout.splitlines():
                 parts = line.split()
                 if parts and parts[0] == serial:
@@ -397,7 +449,7 @@ def check_device_connection(serial: str, timeout: int = 41) -> bool:
 def device_exists_in_list(serial: str) -> bool:
     """Checks if the device serial is present in the list of adb devices in any state."""
     try:
-        result = subprocess.run(["adb", "devices"], capture_output=True, text=True, check=True)
+        result = subprocess.run([ADB_BIN, "devices"], capture_output=True, text=True, check=True)
         for line in result.stdout.splitlines():
             parts = line.split()
             if parts and parts[0] == serial:
@@ -406,9 +458,21 @@ def device_exists_in_list(serial: str) -> bool:
         pass
     return False
 
+def start_emulator(avd_name: str = "Medium_Phone"):
+    """Starts the emulator in the foreground with standard output."""
+    print(f"Starting emulator AVD '{avd_name}'...")
+    if sys.platform.startswith("win"):
+        os.system(f'start cmd /k "{EMULATOR_BIN}" -avd {avd_name}')
+    else:
+        subprocess.Popen([EMULATOR_BIN, "-avd", avd_name])
+
 def main():
     global ADB_SERIAL, TRIED_SLOTS, PENDING_SLOTS
     
+    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+        print(__doc__.strip())
+        sys.exit(0)
+        
     # 1. Handle device connection
     if len(sys.argv) > 1:
         ADB_SERIAL = sys.argv[1]
@@ -431,7 +495,7 @@ def main():
         print("No serial argument provided. Checking for active ADB devices...")
         connected_devices = []
         try:
-            result = subprocess.run(["adb", "devices"], capture_output=True, text=True, check=True)
+            result = subprocess.run([ADB_BIN, "devices"], capture_output=True, text=True, check=True)
             for line in result.stdout.splitlines():
                 parts = line.split()
                 if parts and len(parts) > 1 and parts[1] == "device":
@@ -447,8 +511,8 @@ def main():
         else:
             # No devices are connected, start the default emulator
             ADB_SERIAL = "emulator-5554"
-            print("No active devices found. Starting emulator AVD 'Medium_Phone'...")
-            os.system('start cmd /k emulator -avd Medium_Phone')
+            print("No active devices found.")
+            start_emulator("Medium_Phone")
             print("Waiting up to 41 seconds for the emulator to start and connect...")
             if check_device_connection(ADB_SERIAL, timeout=41):
                 print(f"Emulator '{ADB_SERIAL}' started and connected successfully.")
@@ -522,8 +586,8 @@ def main():
             TRIED_SLOTS.clear()
             PENDING_SLOTS = []
             
-            print("Sleeping for 30 seconds before the next attempt...")
-            time.sleep(30)
+            print("Sleeping for 10 seconds before the next attempt...")
+            time.sleep(10)
     except KeyboardInterrupt:
         print("\nScript interrupted by user. Exiting.")
         sys.exit(0)
