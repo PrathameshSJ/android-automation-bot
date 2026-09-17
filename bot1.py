@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """
-bot.py
+bot1.py
 
-Combines native UI text detection, clicking capabilities, and the attendance
-automated workflow into a single file. Supports passing the target ADB serial 
-via command line arguments. Cross-platform compatible (Linux, macOS, Windows).
+Variant of bot.py with a modified login sequence:
+  - First login click uses find_and_click_by_class_and_index() targeting
+    class="android.widget.ImageView" with index="7" instead of a fixed
+    coordinate tap.
+  - After the ImageView tap, checks for "Low Attendance Alert" text within 6 s.
+    If found, clicks it and proceeds; if not found, gives up on the login step
+    and loops back to the attendance check.
+
+All other behaviour is identical to bot.py.
 
 Usage:
-    python3 bot.py [adb_serial]
-    e.g., python3 bot.py emulator-5554
+    python3 bot1.py [adb_serial]
+    e.g., python3 bot1.py emulator-5554
 """
 
 import sys
@@ -73,19 +79,15 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def dump_ui(retries: int = 2, retry_delay: float = 0.5) -> str:
     """Asks Android to dump the UI tree to XML and pulls it locally to the script folder."""
-    # Using /data/local/tmp because it is always writable by adb shell
     device_path = "/data/local/tmp/window_dump.xml"
     local_path = os.path.join(SCRIPT_DIR, "window_dump.xml")
     
     for attempt in range(retries):
         try:
-            # Generate the XML dump on the device
             result = adb("shell", "uiautomator", "dump", device_path)
             if "ERROR" in (result.stdout or "") or "ERROR" in (result.stderr or ""):
-                # Try compressed dump if standard dump encounters an idle state error
                 adb("shell", "uiautomator", "dump", "--compressed", device_path)
                 
-            # Pull the XML to our local script folder
             adb("pull", device_path, local_path)
             if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
                 return local_path
@@ -110,18 +112,14 @@ def find_text_bounds(xml_path: str, target_text: str) -> tuple:
 
     target_lower = target_text.lower()
     
-    # Iterate through every UI element on the screen
     for node in tree.iter():
         text = node.get('text', '')
         content_desc = node.get('content-desc', '')
         
-        # Check both visible text and accessibility descriptions
         if target_lower in text.lower() or target_lower in content_desc.lower():
             bounds = node.get('bounds')
             
-            # bounds string format looks like this: "[0,100][200,300]"
             if bounds and bounds != "[0,0][0,0]":
-                # Clean up brackets to extract raw integers
                 coords = bounds.replace('][', ',').strip('[]').split(',')
                 try:
                     return tuple(map(int, coords))
@@ -290,7 +288,6 @@ def check_time_n_click(timeout: int = 11) -> bool:
     """
     global TRIED_SLOTS, PENDING_SLOTS
     
-    # Reset PENDING_SLOTS for this scan
     PENDING_SLOTS = []
     
     now = datetime.now()
@@ -302,13 +299,11 @@ def check_time_n_click(timeout: int = 11) -> bool:
     
     time_pattern = re.compile(r"(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})")
     
-    # 1. Dump UI and scan current screen
     print("Checking for time slot on current screen...")
     xml_path = dump_ui()
     slots = find_untried_matching_slots(xml_path, time1, time2, time_pattern)
     untried_slots = [s for s in slots if s["slot_id"] not in TRIED_SLOTS]
     
-    # 2. If not found on current screen, scroll twice and check again
     if not untried_slots:
         print("No untried matching slots found on current screen. Scrolling twice...")
         scroll_up_twice()
@@ -324,10 +319,8 @@ def check_time_n_click(timeout: int = 11) -> bool:
         PENDING_SLOTS = []
         return False
         
-    # We found at least one untried slot!
     target_slot = untried_slots[0]
     
-    # Save the other untried slots in PENDING_SLOTS
     if len(untried_slots) > 1:
         PENDING_SLOTS = [s["slot_id"] for s in untried_slots[1:]]
         print(f"  -> Found multiple untried slots. Saving to pending: {PENDING_SLOTS}")
@@ -347,14 +340,11 @@ def run_attendance_marking_routine() -> bool:
     global TRIED_SLOTS, PENDING_SLOTS
     
     while True:
-        # Check time and click on a matching slot.
         slot_clicked = check_time_n_click()
         if not slot_clicked:
             print("No matching slots found during marking routine.")
             return False
             
-        # A slot was found and clicked!
-        # Now check for Submit button with 4-second timeout
         print("\n--- Checking for 'Submit' ---")
         submit_found = wait_for_text_and_click("Submit", timeout=4)
         if submit_found:
@@ -362,9 +352,7 @@ def run_attendance_marking_routine() -> bool:
             time.sleep(6)
             return True
             
-        # Submit not found!
         print("Submit not found after clicking slot.")
-        # Scroll 2 times with 0.5s delay and check for any additional slots
         scroll_up_twice()
 
 def wait_for_text_and_click(target_text: str, timeout: int) -> bool:
@@ -436,37 +424,31 @@ def close_app_routine(package_name: str = "edu.somaiya.somaiyaapp"):
     """
     print(f"\n--- Soft-closing '{package_name}' and removing from Recents ---")
     try:
-        # Get the recent tasks list
         result = adb("shell", "dumpsys", "activity", "recents")
         output = result.stdout
     except Exception as e:
         print(f"Failed to query recent tasks: {e}")
         return
 
-    # Find all task IDs matching the package name
     task_ids = []
     blocks = output.split("* Recent")
     for block in blocks:
         if package_name in block:
-            # Try to find taskId=X
             task_id_match = re.search(r"\btaskId=(\d+)\b", block)
             if task_id_match:
                 task_ids.append(task_id_match.group(1))
                 continue
             
-            # Try to find id=X
             id_match = re.search(r"\bid=(\d+)\b", block)
             if id_match:
                 task_ids.append(id_match.group(1))
                 continue
 
-            # Try to find #X in Task{... #X ...}
             hash_match = re.search(r"Task\{[a-f0-9]+\s+#(\d+)\b", block)
             if hash_match:
                 task_ids.append(hash_match.group(1))
                 continue
 
-    # Deduplicate task IDs
     unique_task_ids = list(dict.fromkeys(task_ids))
 
     if not unique_task_ids:
@@ -527,7 +509,6 @@ def start_emulator_cold_boot(avd_name: str = None):
     print(f"Starting emulator AVD '{avd_name}' with cold boot (-no-snapshot-load)...")
 
     if sys.platform.startswith("win"):
-        # Launch in a new console window so it doesn't block this process
         cmd = f'start cmd /k "{EMULATOR_BIN}" -avd {avd_name} -no-snapshot-load'
         os.system(cmd)
     else:
@@ -537,7 +518,6 @@ def start_emulator_cold_boot(avd_name: str = None):
             stderr=subprocess.DEVNULL,
         )
 
-    # Block here until the device is fully ready or we give up after 120 s
     print(f"Waiting up to 120 seconds for '{ADB_SERIAL}' to come online after cold boot...")
     if check_device_connection(ADB_SERIAL, timeout=120):
         print(f"Emulator '{ADB_SERIAL}' is online and ready.")
@@ -553,7 +533,6 @@ def force_close_emulator():
     """
     print("Force-closing emulator...")
 
-    # 1. Graceful ADB kill
     try:
         subprocess.run(
             [ADB_BIN, "-s", ADB_SERIAL, "emu", "kill"],
@@ -565,10 +544,8 @@ def force_close_emulator():
     except Exception as e:
         print(f"  -> 'emu kill' failed or timed out: {e}")
 
-    # 2. Give it a moment to die
     time.sleep(3)
 
-    # 3. If still alive, kill the OS process by name
     try:
         if sys.platform.startswith("win"):
             subprocess.run(
@@ -613,13 +590,109 @@ def next_half_hour_timestamp() -> datetime:
     (e.g. 09:30, 10:30, 11:30 …).
     """
     now = datetime.now()
-    # If current minute < 30, the next :30 mark is this hour at :30
     if now.minute < 30:
         return now.replace(minute=30, second=0, microsecond=0)
     else:
-        # Otherwise it is the next hour at :30
         next_hour = now + timedelta(hours=1)
         return next_hour.replace(minute=30, second=0, microsecond=0)
+
+# ---------------------------------------------------------------------------
+# bot1-specific login routine
+# ---------------------------------------------------------------------------
+
+def login_routine_bot1() -> bool:
+    """
+    Modified 3-step login sequence for bot1:
+
+    Step 1 – Click the ImageView at index 7.
+        Uses find_and_click_by_class_and_index() on a fresh UI dump to locate
+        class="android.widget.ImageView" with index="7" and tap its centre.
+        If the element is not found the routine returns False immediately so the
+        outer loop can go back to searching for attendance / whatever is on screen.
+
+    Step 2 – Find and click the text "somaiya.edu".
+        Polls the UI for up to 6 seconds. If not found within that window,
+        returns False so the outer loop retries from the top.
+
+    Step 3 – Find and click "Low Attendance Alert".
+        Polls the UI for up to 6 seconds. If not found, returns False so the
+        outer loop retries from the top (search for Attendance or Login text again).
+
+    Returns:
+        True  – all three steps completed successfully.
+        False – any step failed; outer loop should continue searching.
+    """
+    print("\n--- bot1 Login Routine (3-step) ---")
+
+    # ------------------------------------------------------------------
+    # Step 1: Dump UI and click ImageView index=7
+    # ------------------------------------------------------------------
+    print("Step 1: Dumping UI to find class='android.widget.ImageView' index='7'...")
+    xml_path = dump_ui()
+    clicked = find_and_click_by_class_and_index(xml_path, "android.widget.ImageView", "7")
+
+    if not clicked:
+        print("  -> ImageView index=7 not found. Skipping login step, looping back...")
+        return False
+
+    print("  -> ImageView tapped. Waiting 2 seconds...")
+    time.sleep(2)
+
+    # ------------------------------------------------------------------
+    # Step 2: Find and click "somaiya.edu" text (timeout: 6 s)
+    # ------------------------------------------------------------------
+    print("Step 2: Looking for 'somaiya.edu' text (timeout: 6s)...")
+    start_time = time.time()
+    somaiya_found = False
+
+    while (time.time() - start_time) < 6:
+        xml_path = dump_ui()
+        bounds = find_text_bounds(xml_path, "somaiya.edu")
+        if bounds:
+            x1, y1, x2, y2 = bounds
+            center_x, center_y = (x1 + x2) // 2, (y1 + y2) // 2
+            print(f"  -> 'somaiya.edu' found! Tapping ({center_x}, {center_y}).")
+            tap(center_x, center_y)
+            somaiya_found = True
+            break
+        time.sleep(1.0)
+
+    if not somaiya_found:
+        print("  -> 'somaiya.edu' not found within 6 seconds. "
+              "Timing out, looping back to attendance search...")
+        return False
+
+    print("  -> 'somaiya.edu' tapped. Waiting 2 seconds...")
+    time.sleep(2)
+
+    # ------------------------------------------------------------------
+    # Step 3: Check if "Low Attendance Alert" text is present (timeout: 6 s).
+    # If found, tap the fixed coordinate (975, 345) — same as the original
+    # login routine in bot.py — instead of the element's own centre.
+    # ------------------------------------------------------------------
+    print("Step 3: Checking for 'Low Attendance Alert' text presence (timeout: 6s)...")
+    start_time = time.time()
+    alert_found = False
+
+    while (time.time() - start_time) < 6:
+        xml_path = dump_ui()
+        bounds = find_text_bounds(xml_path, "Low Attendance Alert")
+        if bounds:
+            print("  -> 'Low Attendance Alert' present! Tapping fixed coordinate (975, 345).")
+            tap(975, 345)
+            alert_found = True
+            break
+        time.sleep(1.0)
+
+    if not alert_found:
+        print("  -> 'Low Attendance Alert' not found within 6 seconds. "
+              "Timing out, looping back to attendance search...")
+        return False
+
+    print("  -> Login routine (bot1) complete.")
+    return True
+
+# ---------------------------------------------------------------------------
 
 def main():
     global ADB_SERIAL, AVD_NAME, TRIED_SLOTS, PENDING_SLOTS
@@ -633,7 +706,6 @@ def main():
         ADB_SERIAL = sys.argv[1]
         print(f"Target ADB Serial provided: {ADB_SERIAL}")
         
-        # Check if the device exists in adb devices list
         if device_exists_in_list(ADB_SERIAL):
             print(f"Device '{ADB_SERIAL}' exists. Waiting up to 41 seconds for it to wake/connect...")
             if check_device_connection(ADB_SERIAL, timeout=41):
@@ -646,7 +718,6 @@ def main():
             sys.exit(1)
             
     else:
-        # No args: Check if any device is already connected
         print("No serial argument provided. Checking for active ADB devices...")
         connected_devices = []
         try:
@@ -660,57 +731,36 @@ def main():
             sys.exit(1)
             
         if connected_devices:
-            # Use the first connected device
             ADB_SERIAL = connected_devices[0]
             print(f"Found active device '{ADB_SERIAL}'. Proceeding...")
         else:
-            # No devices are connected – cold-boot the default emulator
             ADB_SERIAL = "emulator-5554"
             print("No active devices found. Cold-booting emulator...")
-            # start_emulator_cold_boot already blocks until ready (up to 120 s)
             start_emulator_cold_boot(AVD_NAME)
-            # start_emulator_cold_boot already prints a warning if the timeout is hit,
-            # but we enforce an explicit check here so we exit cleanly on hard failure.
             if not check_device_connection(ADB_SERIAL, timeout=41):
                 print(f"Error: Emulator '{ADB_SERIAL}' failed to start or connect.")
                 sys.exit(1)
 
     # 2. Run the main workflow loop
-    # -----------------------------------------------------------------------
-    # "No-submit-in-1-hour" tracker.
-    # We record the moment we entered this outer loop and track whether a
-    # Submit was successfully clicked in the last 60 minutes.
-    # -----------------------------------------------------------------------
-    last_submit_time: datetime = datetime.now()          # seed so first hour counts from now
-    emulator_restart_scheduled_after: datetime | None = None  # when a :30-mark restart is due
+    last_submit_time: datetime = datetime.now()
+    emulator_restart_scheduled_after: datetime | None = None
 
     try:
         while True:
             now = datetime.now()
 
-            # ---------------------------------------------------------------
             # Scheduled :30-mark restart check
-            # If a restart was scheduled (because 1 hr passed without Submit),
-            # execute it as soon as we reach or pass that :30 mark.
-            # This fires even if attendance was submitted in between – the
-            # restart was already committed once the hour with no submit
-            # elapsed.
-            # ---------------------------------------------------------------
             if emulator_restart_scheduled_after is not None and now >= emulator_restart_scheduled_after:
                 print(f"\n[SCHEDULER] Reached the scheduled :30-mark restart time "
                       f"({emulator_restart_scheduled_after.strftime('%H:%M')}). "
                       "Restarting emulator now...")
                 restart_emulator_cold_boot()
-                emulator_restart_scheduled_after = None        # clear after executing
-                last_submit_time = datetime.now()             # reset the 1-hr clock
+                emulator_restart_scheduled_after = None
+                last_submit_time = datetime.now()
                 TRIED_SLOTS.clear()
                 PENDING_SLOTS = []
 
-            # ---------------------------------------------------------------
-            # Check whether 1 hour has elapsed without a Submit click.
-            # If so, schedule a restart at the next :30-minute mark (don't
-            # restart immediately – wait for the boundary).
-            # ---------------------------------------------------------------
+            # Check whether 1 hour has elapsed without a Submit click
             if emulator_restart_scheduled_after is None:
                 minutes_since_submit = (now - last_submit_time).total_seconds() / 60
                 if minutes_since_submit >= 60:
@@ -727,14 +777,12 @@ def main():
             print("Launching app package: edu.somaiya.somaiyaapp")
             adb("shell", "monkey", "-p", "edu.somaiya.somaiyaapp", "-c", "android.intent.category.LAUNCHER", "1")
             
-            # Sleep 13 seconds
             print("Sleeping for 13 seconds...")
             time.sleep(13)
             
             attendance_completed = False
             
             while True:
-                # Check attendance (wait up to 11 seconds for "Attendance" text, click if found)
                 print("Checking for 'Attendance' button...")
                 attendance_found = wait_for_text_and_click("Attendance", timeout=11)
                 
@@ -742,51 +790,41 @@ def main():
                     print("Attendance button clicked! Waiting 2 seconds...")
                     time.sleep(2)
                     
-                    # Mark attendance routine with time slot selector
                     print("Starting attendance marking routine...")
                     attendance_completed = run_attendance_marking_routine()
-                    break  # Break out of the inner loop to end the attempt
+                    break
                 else:
                     # If attendance is not found, check for login
                     print("Attendance button not found. Checking for LOGIN / login text...")
                     login_found = check_text_present_with_timeout("login", timeout=4)
                     
                     if login_found:
-                        # Execute login routine
-                        print("Login text found! Executing login routine...")
-                        print("Tapping (660, 1800) exactly...")
-                        tap(660, 1800)
-                        print("Waiting 4 seconds...")
-                        time.sleep(4)
-                        print("Tapping (540, 1250) exactly...")
-                        tap(540, 1250)
-                        print("Waiting 5 seconds...")
-                        time.sleep(5)
-                        print("Tapping (975, 345) exactly...")
-                        tap(975, 345)
-                        print("Waiting 4 seconds...")
-                        time.sleep(4)
-                        
-                        # Loop back to check attendance again
-                        print("Login routine complete. Looping back to check attendance...")
+                        # Execute bot1's modified login routine
+                        print("Login text found! Executing bot1 login routine...")
+                        login_ok = login_routine_bot1()
+
+                        if login_ok:
+                            print("Login routine complete. Looping back to check attendance...")
+                        else:
+                            print("Login routine did not complete (element/alert not found). "
+                                  "Looping back to top of inner loop...")
+                        # Either way, loop back to the top of the inner while loop
                         continue
                     else:
                         print("Login text not found. Aborting this attempt.")
-                        break  # Break out of the inner loop to restart
+                        break
             
             if attendance_completed:
                 print("\nWorkflow completed successfully! Restarting emulator (cold boot)...")
-                last_submit_time = datetime.now()   # reset the 1-hr clock on success
-                emulator_restart_scheduled_after = None  # cancel any pending :30-mark restart
+                last_submit_time = datetime.now()
+                emulator_restart_scheduled_after = None
 
                 close_app_routine()
                 TRIED_SLOTS.clear()
                 PENDING_SLOTS = []
 
-                # Restart the emulator on every successful submission
                 restart_emulator_cold_boot()
 
-                # After cold boot the device will already be online – no extra sleep needed
                 print("Continuing loop after emulator restart...")
                 continue
 
